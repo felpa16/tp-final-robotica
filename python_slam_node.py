@@ -68,6 +68,13 @@ class PythonSlamNode(Node):
         self.current_map_y = 0.0  
         self.current_map_theta = 0.0
 
+        #Initialize angular velocity and rotation parameters
+        self.last_angular_vel = 0.0
+        self.is_rotating = False
+        self.rotation_threshold = 0.1
+        self.rotation_noise_scale = 2.0
+        self.rotation_update_scale = 0.5
+
         # ROS2 publishers/subscribers
         map_qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -99,10 +106,18 @@ class PythonSlamNode(Node):
         self.prev_odom = self.last_odom
         self.last_odom = msg
 
+        #Track angular velocity
+        self.last_angular_vel = msg.twist.twist.angular.z
+        self.is_rotating = abs(self.last_angular_vel) > self.rotation_threshold
+
     def scan_callback(self, msg: LaserScan):
         if self.last_odom is None:
             self.get_logger().warn("No odometry data available yet")
             return
+        
+            # Log rotation status
+        if self.is_rotating:
+            self.get_logger().debug(f"Robot rotating at {self.last_angular_vel:.2f} rad/s")
 
         # 1. Motion update
         odom = self.last_odom
@@ -257,6 +272,16 @@ class PythonSlamNode(Node):
         updates_made = 0
         obstacles_detected = 0
         
+        # Store original values
+        original_log_odds_free = self.log_odds_free
+        original_log_odds_occupied = self.log_odds_occupied
+        
+        # Temporarily modify the instance variables if rotating
+        if hasattr(self, 'is_rotating') and self.is_rotating:
+            self.log_odds_free = self.log_odds_free * 0.5
+            self.log_odds_occupied = self.log_odds_occupied * 0.5
+            self.get_logger().debug("Using reduced update rates during rotation")
+
         # Convert robot position to map coordinates once
         robot_map_x = int((robot_x - self.map_origin_x) / self.resolution)
         robot_map_y = int((robot_y - self.map_origin_y) / self.resolution)
@@ -314,7 +339,9 @@ class PythonSlamNode(Node):
         else:
             self.get_logger().debug("No map updates made this scan")
 
-            
+        # Restore original values
+        self.log_odds_free = original_log_odds_free
+        self.log_odds_occupied = original_log_odds_occupied
 
     def bresenham_line(self, particle, x0, y0, x1, y1):
         """Draw a line using Bresenham's algorithm and mark cells as free."""
