@@ -364,6 +364,31 @@ class PythonSlamNode(Node):
         if cells_updated > 0:
             self.get_logger().debug(f"Bresenham line updated {cells_updated} free cells")
 
+    def log_odds_to_occupancy(self, log_odds):
+        """
+        Convert log-odds to occupancy value for ROS OccupancyGrid.
+        
+        Args:
+            log_odds: Log-odds value from the map
+            
+        Returns:
+            int: Occupancy value (0-100) or -1 for unknown
+        """
+        # Check if cell has never been observed
+        if abs(log_odds) < 0.01:
+            return -1  # Unknown
+        
+        # Convert log-odds to probability
+        # Using the logistic function: p = 1 / (1 + exp(-log_odds))
+        probability = 1.0 / (1.0 + math.exp(-log_odds))
+        
+        # Convert probability [0,1] to occupancy value [0,100]
+        occupancy = int(probability * 100)
+        
+        # Clamp to valid range
+        return max(0, min(100, occupancy))
+
+
     def publish_map(self):
         # TODO: Fill in map_msg fields and publish one map
         map_msg = OccupancyGrid()
@@ -388,30 +413,17 @@ class PythonSlamNode(Node):
             
             # Convert log-odds to occupancy grid values [0-100, -1 for unknown]
             map_data = []
-            occupied_cells = 0
-            free_cells = 0
-            unknown_cells = 0
             
             for y in range(self.map_height_cells):
                 for x in range(self.map_width_cells):
                     log_odds = best_particle.log_odds_map[y, x]
                     
-                    # Use defined thresholds to determine cell state
-                    if log_odds > self.occupied_threshold:
-                        occupancy = 100  # Definitely occupied
-                        occupied_cells += 1
-                    elif log_odds < self.free_threshold:
-                        occupancy = 0   # Definitely free
-                        free_cells += 1
-                    else:
-                        occupancy = -1# Unknown (not enough evidence either way)
-                        unknown_cells += 1
-                    
+                    occupancy = self.log_odds_to_occupancy(log_odds)
                     map_data.append(occupancy)
             
             map_msg.data = map_data
             
-            self.get_logger().info(f"Map published: {occupied_cells} occupied, {free_cells} free, {unknown_cells} unknown cells")
+            self.get_logger().info(f"Map published")
             self.get_logger().debug(f"Best particle weight: {best_particle.weight:.6f}")
             
         else:
