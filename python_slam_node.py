@@ -36,7 +36,7 @@ class PythonSlamNode(Node):
         self.declare_parameter('map_resolution', 0.05)  # meters per cell
         self.declare_parameter('map_width_meters', 10.0)
         self.declare_parameter('map_height_meters', 10.0)
-        self.declare_parameter('num_particles', 100)
+        self.declare_parameter('num_particles', 30)
 
 
         self.resolution = self.get_parameter('map_resolution').get_parameter_value().double_value
@@ -48,18 +48,29 @@ class PythonSlamNode(Node):
         self.map_origin_y = -5.0
 
         # TODO: define the log-odds criteria for free and occupied cells
-        log_odds_occupied = 0.8
-        log_odds_free = 0.2
-        self.log_odds_free = np.log(log_odds_free / (1.0 - log_odds_free))  # -1.39
-        self.log_odds_occupied = np.log(log_odds_occupied / (1.0 - log_odds_occupied)) # 1.39
-
-        self.log_odds_max = 5.0
-        self.log_odds_min = -5.0
+        # Use more aggressive log-odds values to prevent map forgetting
+        # These values are direct log-odds increments, not probabilities
+        self.log_odds_free = -0.8     # Stronger evidence for free space
+        self.log_odds_occupied = 2.0  # Much stronger evidence for obstacles
+        
+        # Wider bounds to allow for more confidence accumulation
+        self.log_odds_max = 8.0   # Strong occupied confidence
+        self.log_odds_min = -8.0  # Strong free confidence
+        
+        # Thresholds for map publishing (these determine when a cell is considered occupied/free)
+        self.occupied_threshold = 1.5   # Log-odds above this = occupied (probability ~0.82)
+        self.free_threshold = -1.5      # Log-odds below this = free (probability ~0.18)
 
         # Particle filter
         self.num_particles = self.get_parameter('num_particles').get_parameter_value().integer_value
         self.particles = [Particle(0.0, 0.0, 0.0, 1.0/self.num_particles, (self.map_height_cells, self.map_width_cells)) for _ in range(self.num_particles)]
         self.last_odom = None
+        self.prev_odom = None  # Store previous odometry for motion calculation
+        
+        # Initialize pose estimates
+        self.current_map_x = 0.0
+        self.current_map_y = 0.0  
+        self.current_map_theta = 0.0
 
         # ROS2 publishers/subscribers
         map_qos_profile = QoSProfile(
@@ -81,16 +92,32 @@ class PythonSlamNode(Node):
             self.scan_callback,
             rclpy.qos.qos_profile_sensor_data)
 
-        self.get_logger().info("Python SLAM node with particle filter initialized.")
+        self.get_logger().info("=== Python SLAM Node Initialized ===")
+        self.get_logger().info(f"Map parameters: {self.map_width_cells}x{self.map_height_cells} cells, resolution={self.resolution}m")
+        self.get_logger().info(f"Map dimensions: {self.map_width_m}x{self.map_height_m}m")
+        self.get_logger().info(f"Map origin: ({self.map_origin_x:.2f}, {self.map_origin_y:.2f})")
+        self.get_logger().info(f"Number of particles: {self.num_particles}")
+        self.get_logger().info(f"Log-odds parameters: free={self.log_odds_free:.2f}, occupied={self.log_odds_occupied:.2f}")
+        self.get_logger().info(f"Log-odds bounds: [{self.log_odds_min:.1f}, {self.log_odds_max:.1f}]")
+        self.get_logger().info(f"Occupancy thresholds: occupied>{self.occupied_threshold:.1f}, free<{self.free_threshold:.1f}")
+        self.get_logger().info("Ready to receive scan data...")
         self.map_publish_timer = self.create_timer(1.0, self.publish_map)
+        
+        # Add flag to handle first scan
+        self.first_scan_processed = False
 
     def odom_callback(self, msg: Odometry):
         # Store odometry for motion update
+        self.prev_odom = self.last_odom  # Store previous odometry
         self.last_odom = msg
+        self.get_logger().debug(f"Odometry callback: x={msg.pose.pose.position.x:.3f}, y={msg.pose.pose.position.y:.3f}")
 
-    def scan_callback(self, msg: LaserScan): #ver parte chequear
+    def scan_callback(self, msg: LaserScan):
         if self.last_odom is None:
+            self.get_logger().warn("No odometry data available yet")
             return
+
+        self.get_logger().debug(f"Scan callback: {len(msg.ranges)} laser readings")
 
         # 1. Motion update (sample motion model)
         odom = self.last_odom
@@ -101,36 +128,78 @@ class PythonSlamNode(Node):
         odom_quat = odom_pose.orientation
         odom_theta = tf_transformations.euler_from_quaternion(
             [odom_quat.x, odom_quat.y, odom_quat.z, odom_quat.w])[2]  # Extract yaw angle
-        self.get_logger().debug(f"Odometry received: x={odom_x}, y={odom_y}, theta={odom_theta}")   
-
-
+        self.get_logger().debug(f"Current odometry: x={odom_x:.3f}, y={odom_y:.3f}, theta={odom_theta:.3f}")   
 
         # TODO: Model the particles around the current pose
+        if self.prev_odom is not None:
+            # Calculate motion since last update
+            prev_pose = self.prev_odom.pose.pose
+            prev_x = prev_pose.position.x
+            prev_y = prev_pose.position.y
+            prev_quat = prev_pose.orientation
+            prev_theta = tf_transformations.euler_from_quaternion(
+                [prev_quat.x, prev_quat.y, prev_quat.z, prev_quat.w])[2]
+            
+            # Motion deltas
+            delta_x = odom_x - prev_x
+            delta_y = odom_y - prev_y
+            delta_theta = self.angle_diff(odom_theta, prev_theta)
+            
+            self.get_logger().debug(f"Motion delta: dx={delta_x:.3f}, dy={delta_y:.3f}, dtheta={delta_theta:.3f}")
+            
+            # Update particles with motion
+            for p in self.particles:
+                # Add noise to simulate motion uncertainty
+                noise_x = np.random.normal(0.0, 0.02)  # Reduced noise
+                noise_y = np.random.normal(0.0, 0.02)  
+                noise_theta = np.random.normal(0.0, 0.02)  
+                
+                p.x += delta_x + noise_x
+                p.y += delta_y + noise_y
+                p.theta = self.angle_diff(p.theta + delta_theta + noise_theta, 0.0)  # Normalize angle
+        else:
+            # First scan - initialize particles around current odometry position
+            for p in self.particles:
+                noise_x = np.random.normal(0.0, 0.1)
+                noise_y = np.random.normal(0.0, 0.1)  
+                noise_theta = np.random.normal(0.0, 0.1)  
+                p.x = odom_x + noise_x
+                p.y = odom_y + noise_y
+                p.theta = odom_theta + noise_theta
+            self.get_logger().info("Initialized particles around starting position")
+
+        # First update the maps before computing weights
         for p in self.particles:
-            # Add noise to simulate motion uncertainty
-            noise_x = np.random.normal(0.0, 0.1)  # Standard deviation of 0.1 meters
-            noise_y = np.random.normal(0.0, 0.1)  # Standard deviation of 0.1 meters
-            noise_theta = np.random.normal(0.0, 0.1)  # Standard deviation of 0.1 radians
-            p.x += odom_x + noise_x
-            p.y += odom_y + noise_y
-            p.theta = self.angle_diff(p.theta + odom_theta + noise_theta, 2 * np.pi)  # Normalize angle
+            self.update_map(p, msg)
+        
+        if not self.first_scan_processed:
+            self.get_logger().info("=== FIRST SCAN RECEIVED ===")
+            valid_ranges = [r for r in msg.ranges if not math.isnan(r) and msg.range_min <= r <= msg.range_max]
+            self.get_logger().info(f"Scan has {len(msg.ranges)} total readings, {len(valid_ranges)} valid")
+            if valid_ranges:
+                self.get_logger().info(f"Range stats: min={min(valid_ranges):.2f}m, max={max(valid_ranges):.2f}m, avg={sum(valid_ranges)/len(valid_ranges):.2f}m")
+            self.get_logger().info(f"Scan parameters: angles [{msg.angle_min:.2f}, {msg.angle_max:.2f}] rad")
+            self.first_scan_processed = True
         
 
         # TODO: 2. Measurement update (weight particles)
         weights = []
-        for p in self.particles:
+        for i, p in enumerate(self.particles):
             weight = self.compute_weight(p, msg) # Compute weights for each particle
-            # Save, append
             weights.append(weight)
-        weights = np.array(weights)
-        weights_sum = np.sum(weights)
-        weights /= weights_sum
-
-        self.get_logger().debug(f"Particle weights: {weights}")
+            self.get_logger().debug(f"Particle {i}: weight={weight:.6f}, pose=({p.x:.2f}, {p.y:.2f}, {p.theta:.2f})")
         
+        weights = np.array(weights)
+        if np.sum(weights) > 0:
+            weights /= np.sum(weights)
+        else:
+            # All weights are zero, reset to uniform
+            weights.fill(1.0 / len(weights))
+            self.get_logger().warn("All particle weights were zero, resetting to uniform distribution")
+
+        self.get_logger().debug(f"Normalized weights sum: {np.sum(weights):.6f}, max: {np.max(weights):.6f}")
 
         # Normalize weights
-
         for i, p in enumerate(self.particles):
             p.weight = weights[i] # Resave weights
 
@@ -141,30 +210,35 @@ class PythonSlamNode(Node):
         # Calculate weighted mean pose from all particles
         total_weight = sum(p.weight for p in self.particles)
 
-        # Weighted mean for x and y coordinates
-        self.current_map_x = sum(p.x * p.weight for p in self.particles) / total_weight
-        self.current_map_y = sum(p.y * p.weight for p in self.particles) / total_weight
-        
-        # For angles, we need to handle the circular nature (avoid averaging 359° and 1°)
-        # Convert to unit vectors, average, then convert back
-        cos_sum = sum(np.cos(p.theta) * p.weight for p in self.particles)
-        sin_sum = sum(np.sin(p.theta) * p.weight for p in self.particles)
-        self.current_map_theta = np.arctan2(sin_sum, cos_sum)
+        if total_weight > 0:
+            # Weighted mean for x and y coordinates
+            self.current_map_x = sum(p.x * p.weight for p in self.particles) / total_weight
+            self.current_map_y = sum(p.y * p.weight for p in self.particles) / total_weight
+            
+            # For angles, we need to handle the circular nature (avoid averaging 359° and 1°)
+            # Convert to unit vectors, average, then convert back
+            cos_sum = sum(np.cos(p.theta) * p.weight for p in self.particles) / total_weight
+            sin_sum = sum(np.sin(p.theta) * p.weight for p in self.particles) / total_weight
+            self.current_map_theta = np.arctan2(sin_sum, cos_sum)
+        else:
+            # Fallback to odometry if no valid weights
+            self.current_map_x = odom_x
+            self.current_map_y = odom_y
+            self.current_map_theta = odom_theta
 
-        self.get_logger().debug(f"Current map pose: x={self.current_map_x}, y={self.current_map_y}, theta={self.current_map_theta}")
-        #CHEQUEAR QUE ONDA
-
-        # 5. Mapping (update map with best particle's pose)
-        for p in self.particles:
-            self.update_map(p, msg)
+        self.get_logger().debug(f"Estimated pose: x={self.current_map_x:.3f}, y={self.current_map_y:.3f}, theta={self.current_map_theta:.3f}")
 
         # 6. Broadcast map->odom transform
         self.broadcast_map_to_odom()
 
-    def compute_weight(self, particle, scan_msg): #ver mensaje bauti
+    def compute_weight(self, particle, scan_msg):
         # Simple likelihood: count how many endpoints match occupied cells
         score = 0.0
+        valid_measurements = 0
         robot_x, robot_y, robot_theta = particle.x, particle.y, particle.theta
+        
+        self.get_logger().debug(f"Computing weight for particle at ({robot_x:.2f}, {robot_y:.2f}, {robot_theta:.2f})")
+        
         for i, range_dist in enumerate(scan_msg.ranges):
             if range_dist < scan_msg.range_min or range_dist > scan_msg.range_max or math.isnan(range_dist):
                 continue
@@ -183,30 +257,32 @@ class PythonSlamNode(Node):
             map_x = int((endpoint_x - self.map_origin_x) / self.resolution)
             map_y = int((endpoint_y - self.map_origin_y) / self.resolution)
 
-
-            
             # TODO: Use particle.log_odds_map for scoring
             # Check if the endpoint is within map bounds
             if 0 <= map_x < self.map_width_cells and 0 <= map_y < self.map_height_cells:
+                valid_measurements += 1
                 # Get the log-odds value at this location
                 log_odds_value = particle.log_odds_map[map_y, map_x]
                 
                 # Convert log-odds to probability: P = exp(log_odds) / (1 + exp(log_odds))
-                # For numerical stability, use different formulas based on log_odds sign
-                if log_odds_value > 0:
-                    prob_occupied = log_odds_value / (1.0 + log_odds_value)
+                # For numerical stability, use sigmoid function
+                if abs(log_odds_value) < 0.01:  # Nearly unknown
+                    prob_occupied = 0.5  # Neutral probability
                 else:
-                    exp_log_odds = math.exp(log_odds_value)
-                    prob_occupied = exp_log_odds / (1.0 + exp_log_odds)
+                    prob_occupied = 1.0 / (1.0 + math.exp(-log_odds_value))
                 
                 # Add to score - higher probability of occupation = higher score
                 score += prob_occupied
             else:
                 # Penalize points outside the map
-                score -= 0.1
+                score -= 0.5
 
-
-        return score + 1e-6
+        # Normalize by number of valid measurements
+        if valid_measurements > 0:
+            score /= valid_measurements
+        
+        self.get_logger().debug(f"Particle weight: score={score:.4f}, valid_measurements={valid_measurements}")
+        return max(score + 1e-6, 1e-6)  # Ensure minimum weight
 
     def resample_particles(self, particles):
         # TODO: Resample particles
@@ -253,11 +329,25 @@ class PythonSlamNode(Node):
 
     def update_map(self, particle, scan_msg):
         robot_x, robot_y, robot_theta = particle.x, particle.y, particle.theta
+        updates_made = 0
+        obstacles_detected = 0
+        
+        # Convert robot position to map coordinates once
+        robot_map_x = int((robot_x - self.map_origin_x) / self.resolution)
+        robot_map_y = int((robot_y - self.map_origin_y) / self.resolution)
+        
+        self.get_logger().debug(f"Updating map for particle at ({robot_x:.2f}, {robot_y:.2f}, {robot_theta:.2f})")
+        self.get_logger().debug(f"Robot map coordinates: ({robot_map_x}, {robot_map_y})")
+        
         for i, range_dist in enumerate(scan_msg.ranges):
+            # Skip invalid measurements
+            if math.isnan(range_dist) or range_dist < scan_msg.range_min:
+                continue
+                
+            # Determine if this is a hit (obstacle detected) or max range
             is_hit = range_dist < scan_msg.range_max
             current_range = min(range_dist, scan_msg.range_max)
-            if math.isnan(current_range) or current_range < scan_msg.range_min:
-                continue
+            
             # TODO: Update map: transform the scan into the map frame
             # Calculate the angle of this laser beam
             beam_angle = scan_msg.angle_min + i * scan_msg.angle_increment
@@ -268,10 +358,6 @@ class PythonSlamNode(Node):
             endpoint_x = robot_x + current_range * math.cos(global_angle)
             endpoint_y = robot_y + current_range * math.sin(global_angle)
             
-            # Convert robot position to map coordinates
-            robot_map_x = int((robot_x - self.map_origin_x) / self.resolution)
-            robot_map_y = int((robot_y - self.map_origin_y) / self.resolution)
-            
             # Convert endpoint to map coordinates
             endpoint_map_x = int((endpoint_x - self.map_origin_x) / self.resolution)
             endpoint_map_y = int((endpoint_y - self.map_origin_y) / self.resolution)
@@ -281,29 +367,66 @@ class PythonSlamNode(Node):
             self.bresenham_line(particle, robot_map_x, robot_map_y, endpoint_map_x, endpoint_map_y)
 
             # TODO: Update particle.log_odds_map accordingly
-            # Mark the endpoint as occupied if we hit something
+            # Mark the endpoint as occupied if we hit something within bounds
             if is_hit and 0 <= endpoint_map_x < self.map_width_cells and 0 <= endpoint_map_y < self.map_height_cells:
+                old_value = particle.log_odds_map[endpoint_map_y, endpoint_map_x]
                 particle.log_odds_map[endpoint_map_y, endpoint_map_x] += self.log_odds_occupied
                 particle.log_odds_map[endpoint_map_y, endpoint_map_x] = np.clip(
                     particle.log_odds_map[endpoint_map_y, endpoint_map_x], 
                     self.log_odds_min, 
                     self.log_odds_max
                 )
+                new_value = particle.log_odds_map[endpoint_map_y, endpoint_map_x]
+                updates_made += 1
+                obstacles_detected += 1
+                
+                # Log significant obstacle detections
+                if abs(old_value - new_value) > 0.1:
+                    self.get_logger().debug(f"Obstacle detected at ({endpoint_map_x},{endpoint_map_y}): {old_value:.2f} -> {new_value:.2f}")
+
+        if updates_made > 0:
+            self.get_logger().info(f"Map updated: {obstacles_detected} obstacles detected, {updates_made} total updates")
+        else:
+            self.get_logger().debug("No map updates made this scan")
 
             
 
     def bresenham_line(self, particle, x0, y0, x1, y1):
+        """Draw a line using Bresenham's algorithm and mark cells as free."""
         dx = abs(x1 - x0)
         dy = abs(y1 - y0)
         sx = 1 if x0 < x1 else -1
         sy = 1 if y0 < y1 else -1
         err = dx - dy
         path_len = 0
-        max_path_len = dx + dy
-        while not (x0 == x1 and y0 == y1) and path_len < max_path_len:
+        max_path_len = dx + dy + 10  # Allow a bit more leeway
+        cells_updated = 0
+        
+        # Stop one cell before the endpoint to avoid marking the obstacle as free
+        while path_len < max_path_len:
+            # Check if we're at the endpoint (stop before marking it)
+            if x0 == x1 and y0 == y1:
+                break
+                
+            # Check bounds before updating
             if 0 <= x0 < self.map_width_cells and 0 <= y0 < self.map_height_cells:
-                particle.log_odds_map[y0, x0] += self.log_odds_free
-                particle.log_odds_map[y0, x0] = np.clip(particle.log_odds_map[y0, x0], self.log_odds_min, self.log_odds_max)
+                # Only update if we're not too close to the endpoint
+                distance_to_end = abs(x1 - x0) + abs(y1 - y0)
+                if distance_to_end > 1:  # Don't mark the cell right next to obstacle as free
+                    old_value = particle.log_odds_map[y0, x0]
+                    particle.log_odds_map[y0, x0] += self.log_odds_free
+                    particle.log_odds_map[y0, x0] = np.clip(
+                        particle.log_odds_map[y0, x0], 
+                        self.log_odds_min, 
+                        self.log_odds_max
+                    )
+                    cells_updated += 1
+                    
+                    # Log significant changes
+                    if abs(old_value - particle.log_odds_map[y0, x0]) > 0.1:
+                        self.get_logger().debug(f"Free cell update at ({x0},{y0}): {old_value:.2f} -> {particle.log_odds_map[y0, x0]:.2f}")
+            
+            # Move to next cell
             e2 = 2 * err
             if e2 > -dy:
                 err -= dy
@@ -312,6 +435,9 @@ class PythonSlamNode(Node):
                 err += dx
                 y0 += sy
             path_len += 1
+            
+        if cells_updated > 0:
+            self.get_logger().debug(f"Bresenham line updated {cells_updated} free cells")
 
     def publish_map(self):
         # TODO: Fill in map_msg fields and publish one map
@@ -337,31 +463,39 @@ class PythonSlamNode(Node):
             
             # Convert log-odds to occupancy grid values [0-100, -1 for unknown]
             map_data = []
+            occupied_cells = 0
+            free_cells = 0
+            unknown_cells = 0
+            
             for y in range(self.map_height_cells):
                 for x in range(self.map_width_cells):
                     log_odds = best_particle.log_odds_map[y, x]
                     
-                    # Convert log-odds to probability
-                    if abs(log_odds) < 0.1:  # Unknown threshold
-                        occupancy = -1  # Unknown
+                    # Use defined thresholds to determine cell state
+                    if log_odds > self.occupied_threshold:
+                        occupancy = 100  # Definitely occupied
+                        occupied_cells += 1
+                    elif log_odds < self.free_threshold:
+                        occupancy = 0   # Definitely free
+                        free_cells += 1
                     else:
-                        # Convert to probability: P = exp(log_odds) / (1 + exp(log_odds))
-                        if log_odds > 0:
-                            prob = log_odds / (1.0 + log_odds)
-                        else:
-                            exp_log_odds = math.exp(log_odds)
-                            prob = exp_log_odds / (1.0 + exp_log_odds)
-                        
-                        # Scale to 0-100 range
-                        occupancy = int(prob * 100)
-                        occupancy = max(0, min(100, occupancy))
+                        occupancy = -1  # Unknown (not enough evidence either way)
+                        unknown_cells += 1
                     
                     map_data.append(occupancy)
             
             map_msg.data = map_data
+            
+            self.get_logger().info(f"Map published: {occupied_cells} occupied, {free_cells} free, {unknown_cells} unknown cells")
+            self.get_logger().debug(f"Best particle weight: {best_particle.weight:.6f}")
+            
+        else:
+            # No particles, publish empty map
+            map_data = [-1] * (self.map_width_cells * self.map_height_cells)
+            map_msg.data = map_data
+            self.get_logger().warn("No particles available, publishing empty map")
         
         self.map_publisher.publish(map_msg)
-        self.get_logger().debug("Map published.")
 
     def broadcast_map_to_odom(self):
         # TODO: Broadcast map->odom transform
@@ -426,6 +560,7 @@ class PythonSlamNode(Node):
 
     @staticmethod
     def angle_diff(a, b):
+        """Calculate the difference between two angles, handling wrap-around"""
         d = a - b
         while d > np.pi:
             d -= 2 * np.pi
@@ -445,4 +580,6 @@ def main(args=None):
         rclpy.shutdown()
 
 if __name__ == '__main__':
+    print("AAAAAAAA donde estoy ahora")
     main()
+
