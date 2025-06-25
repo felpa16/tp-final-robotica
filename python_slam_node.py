@@ -32,20 +32,11 @@ class PythonSlamNode(Node):
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_footprint')
 
-
-
-
-
         # TODO: define map resolution, width, height, and number of particles
         self.declare_parameter('map_resolution', 0.01)  # meters per cell
         self.declare_parameter('map_width_meters', 2.0)                #200x200 cells
         self.declare_parameter('map_height_meters', 2.0)
         self.declare_parameter('num_particles', 10) #buati dijo que empecemos con 10. Aumentar.
-        #FIN
-
-
-
-
 
         self.resolution = self.get_parameter('map_resolution').get_parameter_value().double_value
         self.map_width_m = self.get_parameter('map_width_meters').get_parameter_value().double_value
@@ -55,14 +46,9 @@ class PythonSlamNode(Node):
         self.map_origin_x = -self.map_width_m / 2.0
         self.map_origin_y = -5.0
 
-
-
-
         # TODO: define the log-odds criteria for free and occupied cells
         self.log_odds_free = -0.5  
         self.log_odds_occupied = 2.0
-        #FIN
-
 
         self.log_odds_max = 5.0
         self.log_odds_min = -5.0
@@ -73,7 +59,6 @@ class PythonSlamNode(Node):
         self.last_odom = None
 
         self.prev2last_odom = None        #ME GUARDO PARA EL CALCULO DELTA - cambios nuestros
-
 
         # ROS2 publishers/subscribers
         map_qos_profile = QoSProfile(
@@ -112,7 +97,6 @@ class PythonSlamNode(Node):
 
         # 1. Motion update (sample motion model)
         odom = self.last_odom
-
 
         # TODO: Retrieve odom_pose from odom message - remember that orientation is a quaternion
         self.get_logger().debug("Processing scan with odometry data.")
@@ -154,10 +138,6 @@ class PythonSlamNode(Node):
                 p.y += delta_y + noise_y
                 p.theta = self.angle_diff(p.theta + delta_theta + noise_theta, 0.0)  # Normalizo angulo [-pi, pi]
 
-        #FIN 
-
-
-
         # TODO: 2. Measurement update (weight particles)
         weights = []
         for p in self.particles:
@@ -172,18 +152,12 @@ class PythonSlamNode(Node):
         else:
             weights.fill(1.0 / len(weights))
             self.get_logger().warn("All particle weights were zero, resetting to uniform distribution")
-        #FIN 
-
-
-
 
         for i, p in enumerate(self.particles):
             p.weight = weights[i] # Resave weights
         
         # 3. Resample
         self.particles = self.resample_particles(self.particles)
-
-
 
         # TODO: 4. Use weighted mean of all particles for mapping and pose (update current_map_pose and current_odom_pose, for each particle)
         total_weight = sum(p.weight for p in self.particles)
@@ -193,10 +167,7 @@ class PythonSlamNode(Node):
             
             cos_sum = sum(np.cos(p.theta) * p.weight for p in self.particles) / total_weight
             sin_sum = sum(np.sin(p.theta) * p.weight for p in self.particles) / total_weight
-            self.current_map_theta = np.arctan2(sin_sum, cos_sum)
-        #FIN 
-
-
+            self.current_map_theta = np.arctan2(sin_sum, cos_sum)        #FIN 
 
         # 5. Mapping (update map with best particle's pose)
         for p in self.particles:
@@ -216,17 +187,12 @@ class PythonSlamNode(Node):
             if range_dist < scan_msg.range_min or range_dist > scan_msg.range_max or math.isnan(range_dist):
                 continue
 
-
-
-
             # TODO: Compute the map coordinates of the endpoint: transform the scan into the map frame
             angle = scan_msg.angle_min + i * scan_msg.angle_increment
             endpoint_x = robot_x + range_dist * np.cos(robot_theta + angle)
             endpoint_y = robot_y + range_dist * np.sin(robot_theta + angle)
             map_x = int((endpoint_x - self.map_origin_x) / self.resolution)
             map_y = int((endpoint_y - self.map_origin_y) / self.resolution)
-
-        
 
             # TODO: Use particle.log_odds_map for scoring
             if 0 <= map_x < self.map_width_cells and 0 <= map_y < self.map_height_cells:
@@ -241,8 +207,6 @@ class PythonSlamNode(Node):
 
         if valid_measurements > 0:
             score /= valid_measurements
-
-
 
         return score + 1e-6
 
@@ -271,7 +235,6 @@ class PythonSlamNode(Node):
                 1.0/len(particles),
                 selected_particle.log_odds_map.shape
             )
-
             new_particle.log_odds_map = selected_particle.log_odds_map.copy() #hago copia del mapa del particle seleccionado
             new_particles.append(new_particle)
 
@@ -286,9 +249,6 @@ class PythonSlamNode(Node):
             if math.isnan(current_range) or current_range < scan_msg.range_min:
                 continue
 
-
-
-
             # TODO: Update map: transform the scan into the map frame
             beam_angle = scan_msg.angle_min + i * scan_msg.angle_increment
             global_angle = robot_theta + beam_angle
@@ -298,9 +258,6 @@ class PythonSlamNode(Node):
             
             endpoint_map_x = int((endpoint_x - self.map_origin_x) / self.resolution)
             endpoint_map_y = int((endpoint_y - self.map_origin_y) / self.resolution)
-
-
-
 
             # TODO: Use self.bresenham_line for free cells
             robot_map_x = int((robot_x - self.map_origin_x) / self.resolution)
