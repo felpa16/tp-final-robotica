@@ -53,6 +53,9 @@ class PythonSlamNode(Node):
         self.log_odds_max = 5.0
         self.log_odds_min = -5.0
 
+        self.occupied_threshold = 3.0
+        self.free_threshold = -2.0
+
         # Particle filter
         self.num_particles = self.get_parameter('num_particles').get_parameter_value().integer_value
         self.particles = [Particle(0.0, 0.0, 0.0, 1.0/self.num_particles, (self.map_height_cells, self.map_width_cells)) for _ in range(self.num_particles)]
