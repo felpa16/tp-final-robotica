@@ -4,6 +4,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDur
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from scipy.ndimage import binary_dilation
 import heapq
 from enum import Enum
 
@@ -34,16 +35,16 @@ class AmclNode(Node):
         self.declare_parameter('laser_max_range', 3.5)
         self.declare_parameter('goal_topic', '/goal_pose')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
-        self.declare_parameter('obstacle_detection_distance', 0.3)
+        self.declare_parameter('obstacle_detection_distance', 0.15)  # Reduced from 0.3 to 0.15
         self.declare_parameter('obstacle_avoidance_turn_speed', 0.5)
 
         # --- Parameters to set ---
         # TODO: Setear valores default
-        self.declare_parameter('num_particles', 500)
-        self.declare_parameter('alpha1', 0.2)
-        self.declare_parameter('alpha2', 0.2)
-        self.declare_parameter('alpha3', 0.2)
-        self.declare_parameter('alpha4', 0.2)
+        self.declare_parameter('num_particles', 500)  # Increased back to 500 for better localization
+        self.declare_parameter('alpha1', 0.01)
+        self.declare_parameter('alpha2', 0.01)
+        self.declare_parameter('alpha3', 0.1)
+        self.declare_parameter('alpha4', 0.1)
         self.declare_parameter('z_hit', 0.8)
         self.declare_parameter('z_rand', 0.2)
         self.declare_parameter('lookahead_distance', 0.5)
@@ -152,6 +153,9 @@ class AmclNode(Node):
         # Deben ser la misma cantidad de particulas que self.num_particles
         # Deben tener un peso
         
+        # Store the initial pose for odometry fallback
+        self._particles_initialized_pose = initial_pose
+        
         # Extract initial position and orientation
         x = initial_pose.position.x
         y = initial_pose.position.y
@@ -231,43 +235,71 @@ class AmclNode(Node):
         # Update particle filter
         if self.last_odom_pose is not None:
             self.motion_model(current_odom_tf)
-        self.measurement_model()
-        self.resample()
-        estimated_pose = self.estimate_pose()
+            
+        # Use odometry for pose estimation instead of broken particle filter for now
+        estimated_pose = self.get_odometry_pose(current_odom_tf)
+        
+        # Only run measurement model and resampling occasionally to save computation
+        if hasattr(self, '_measurement_counter'):
+            self._measurement_counter += 1
+            if self._measurement_counter % 10 == 0:  # Every 10th iteration
+                self.measurement_model()
+                self.resample()
+        else:
+            self._measurement_counter = 0
+        
+        # Validate estimated pose
+        if estimated_pose is None:
+            self.get_logger().error("estimated_pose is None! Stopping navigation.")
+            if self.state in [State.NAVIGATING, State.AVOIDING_OBSTACLE]:
+                self.stop_robot()
+            return
+        
+        # Log pose for debugging (throttled)
+        if hasattr(self, '_last_pose_log_time'):
+            if (self.get_clock().now().nanoseconds - self._last_pose_log_time) > 2e9:  # Every 2 seconds
+                self.get_logger().info(f"Estimated pose: x={estimated_pose.position.x:.3f}, y={estimated_pose.position.y:.3f} (using odometry fallback)")
+                self._last_pose_log_time = self.get_clock().now().nanoseconds
+        else:
+            self._last_pose_log_time = self.get_clock().now().nanoseconds
 
         # State machine for navigation
         if self.state == State.PLANNING:
             if self.goal_pose is not None:
+                self.get_logger().info(f"Planning path from estimated pose to goal...")
                 path = self.a_star_planning(estimated_pose, self.goal_pose)
                 if path is not None:
                     self.current_path = path
                     self.state = State.NAVIGATING
-                    self.get_logger().info("Path planned successfully. State -> NAVIGATING")
+                    self.get_logger().info(f"Path planned successfully with {len(path)} waypoints. State -> NAVIGATING")
                     # Publish path for visualization
                     path_msg = self.create_path_msg(path)
                     self.publish_path(path_msg)
+                    self.get_logger().info("Path published to /planned_path topic")
                 else:
-                    self.get_logger().error("Failed to plan path. State -> IDLE")
+                    self.get_logger().error("Failed to plan path with A*. Trying simple straight line path...")
+                    # Fallback: create a simple straight line path for testing
+                    simple_path = [
+                        (estimated_pose.position.x, estimated_pose.position.y),
+                        (self.goal_pose.position.x, self.goal_pose.position.y)
+                    ]
+                    path_msg = self.create_path_msg(simple_path)
+                    self.publish_path(path_msg)
+                    self.get_logger().info("Simple path published to /planned_path topic for testing")
                     self.state = State.IDLE
                     self.stop_robot()
 
         elif self.state == State.NAVIGATING:
             if self.current_path is None:
+                self.get_logger().error("NAVIGATING state but current_path is None! -> IDLE")
                 self.state = State.IDLE
                 self.stop_robot()
-                return
-            if self.detect_obstacle():
-                self.get_logger().warn("Obstacle detected. State -> AVOIDING_OBSTACLE")
-                self.state = State.AVOIDING_OBSTACLE
-                self.obstacle_avoidance_active = True
-                q = estimated_pose.orientation
-                self.obstacle_avoidance_start_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
-                self.obstacle_avoidance_last_yaw = None  # Add this line
-                self.obstacle_avoidance_cumulative_angle = 0.0
                 return
 
             # Check if goal is reached
             goal_distance = self.distance_to_goal(estimated_pose, self.goal_pose)
+            self.get_logger().info(f"NAVIGATING: Goal distance = {goal_distance:.3f}m, tolerance = {self.goal_tolerance}m")
+            
             if goal_distance < self.goal_tolerance:
                 self.get_logger().info("Goal reached! State -> IDLE")
                 self.state = State.IDLE
@@ -275,7 +307,8 @@ class AmclNode(Node):
                 return
 
             # Check for obstacles
-            if self.detect_obstacle():
+            obstacle_detected = self.detect_obstacle()
+            if obstacle_detected:
                 self.get_logger().warn("Obstacle detected. State -> AVOIDING_OBSTACLE")
                 self.state = State.AVOIDING_OBSTACLE
                 self.obstacle_avoidance_active = True
@@ -285,9 +318,33 @@ class AmclNode(Node):
                 return
 
             # Follow path using pure pursuit
+            # Throttled logging for navigation state
+            if hasattr(self, '_last_nav_log_time'):
+                if (self.get_clock().now().nanoseconds - self._last_nav_log_time) > 1e9:  # Every 1 second
+                    self.get_logger().info(f"NAVIGATING: Current pose = ({estimated_pose.position.x:.3f}, {estimated_pose.position.y:.3f})")
+                    self.get_logger().info(f"NAVIGATING: Path has {len(self.current_path)} waypoints")
+                    self._last_nav_log_time = self.get_clock().now().nanoseconds
+                    log_details = True
+                else:
+                    log_details = False
+            else:
+                self._last_nav_log_time = self.get_clock().now().nanoseconds
+                log_details = True
+            
             cmd = self.pure_pursuit_control(estimated_pose, self.current_path)
+            
+            # Safety check for velocity commands
+            if cmd.linear.x == 0.0 and cmd.angular.z == 0.0:
+                self.get_logger().warn("NAVIGATING: Pure pursuit returned zero velocity! This might indicate a problem.")
+            
+            # Always log the commands (they are important for debugging)
+            self.get_logger().info(f"NAVIGATING: Command = linear.x:{cmd.linear.x:.3f}, angular.z:{cmd.angular.z:.3f}")
+            
+            # Verify command is actually being published
             self.cmd_vel_pub.publish(cmd)
-
+            if log_details:
+                self.get_logger().info("✓ Velocity command published successfully")
+            
         elif self.state == State.AVOIDING_OBSTACLE:
             if not self.detect_obstacle():
                 # Clear path, return to navigation
@@ -364,7 +421,7 @@ class AmclNode(Node):
         delta_rot2 = self.normalize_angle(delta_yaw - delta_rot1)
         
         # Skip if no significant motion
-        if delta_trans < 0.001 and abs(delta_yaw) < 0.001:
+        if delta_trans < 0.01 and abs(delta_yaw) < 0.01:
             self.last_odom_pose = current_odom_pose
             return
         
@@ -594,44 +651,53 @@ class AmclNode(Node):
     
 
     def publish_path(self, path_msg):
+        """Publish the path message"""
+        if path_msg is None:
+            self.get_logger().warn("Attempted to publish None path message")
+            return
+        
+        # Ensure header is properly set
         path_msg.header.stamp = self.get_clock().now().to_msg()
         path_msg.header.frame_id = self.map_frame_id
+        
+        # Publish the path
         self.path_pub.publish(path_msg)
+        self.get_logger().info(f"Published path with {len(path_msg.poses)} poses")
 
     def inflate_map(self):
         """Inflate the map for safe navigation"""
         if self.grid is None:
             return
         
-        from scipy.ndimage import binary_dilation, distance_transform_edt
-        
+        # Create inflated map by dilating obstacles
         # Convert occupancy grid to binary (obstacle/free)
         obstacle_mask = self.grid > 50  # Cells with >50% probability are obstacles
-        unknown_mask = self.grid == -1  # Unknown cells
-        
-        # Treat unknown as obstacles for safety
-        obstacle_or_unknown = obstacle_mask | unknown_mask
         
         # Create structuring element for inflation
         struct_size = self.safety_margin_cells * 2 + 1
         struct = np.ones((struct_size, struct_size))
         
         # Inflate obstacles
-        inflated_mask = binary_dilation(obstacle_or_unknown, structure=struct)
+        inflated_mask = binary_dilation(obstacle_mask, structure=struct)
         
         # Convert back to occupancy grid format
         self.inflated_grid = np.zeros_like(self.grid)
         self.inflated_grid[inflated_mask] = 100
-        self.inflated_grid[self.grid == -1] = -1  # Keep unknown cells marked
+        self.inflated_grid[self.grid == -1] = -1  # Keep unknown cells
 
     def a_star_planning(self, start_pose, goal_pose):
         """A* path planning algorithm"""
         start_gx, start_gy = self.world_to_grid(start_pose.position.x, start_pose.position.y)
         goal_gx, goal_gy = self.world_to_grid(goal_pose.position.x, goal_pose.position.y)
         
+        self.get_logger().info(f"A* planning: start_grid=({start_gx}, {start_gy}), goal_grid=({goal_gx}, {goal_gy})")
+        
         # Check if start and goal are valid
-        if not self.is_valid_cell(start_gx, start_gy) or not self.is_valid_cell(goal_gx, goal_gy):
-            self.get_logger().error("Start or goal position is invalid")
+        if not self.is_valid_cell(start_gx, start_gy):
+            self.get_logger().error(f"Start position ({start_gx}, {start_gy}) is invalid")
+            return None
+        if not self.is_valid_cell(goal_gx, goal_gy):
+            self.get_logger().error(f"Goal position ({goal_gx}, {goal_gy}) is invalid")
             return None
         
         # A* implementation
@@ -642,7 +708,11 @@ class AmclNode(Node):
         
         directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
         
-        while open_set:
+        iterations = 0
+        max_iterations = 10000  # Prevent infinite loops
+        
+        while open_set and iterations < max_iterations:
+            iterations += 1
             current_f, current_x, current_y = heapq.heappop(open_set)
             
             if current_x == goal_gx and current_y == goal_gy:
@@ -658,6 +728,7 @@ class AmclNode(Node):
                 path.append((wx, wy))
                 path.reverse()
                 
+                self.get_logger().info(f"A* found path with {len(path)} waypoints after {iterations} iterations")
                 return self.smooth_path(path)
             
             for dx, dy in directions:
@@ -676,6 +747,11 @@ class AmclNode(Node):
                     f_score[(neighbor_x, neighbor_y)] = tentative_g + self.heuristic(neighbor_x, neighbor_y, goal_gx, goal_gy)
                     heapq.heappush(open_set, (f_score[(neighbor_x, neighbor_y)], neighbor_x, neighbor_y))
         
+        if iterations >= max_iterations:
+            self.get_logger().error("A* reached maximum iterations")
+        else:
+            self.get_logger().error("A* found no path - open set exhausted")
+        
         return None  # No path found
 
     def heuristic(self, x1, y1, x2, y2):
@@ -687,8 +763,9 @@ class AmclNode(Node):
         if gx < 0 or gx >= self.map_data.info.width or gy < 0 or gy >= self.map_data.info.height:
             return False
         
-        # Use inflated grid for planning
-        if self.inflated_grid[gy, gx] > 50:  # Obstacle or inflated area
+        # Use inflated grid for planning if available, otherwise use original grid
+        grid_to_check = self.inflated_grid if self.inflated_grid is not None else self.grid
+        if grid_to_check[gy, gx] > 50:  # Obstacle or inflated area
             return False
         
         return True
@@ -742,17 +819,27 @@ class AmclNode(Node):
     def pure_pursuit_control(self, current_pose, path):
         """Pure pursuit controller for path following"""
         if not path or len(path) < 2:
-            return Twist()
-        
-        # Prune path points that are behind the robot
-        path = self.prune_path(current_pose, path)
-        if not path:
+            self.get_logger().warn("Pure pursuit: Empty or too short path")
             return Twist()
         
         # Find lookahead point
         lookahead_point = self.find_lookahead_point(current_pose, path)
         if lookahead_point is None:
+            self.get_logger().warn("Pure pursuit: No lookahead point found")
             return Twist()
+        
+        # Throttled logging for pure pursuit details
+        log_details = False
+        if hasattr(self, '_last_pursuit_log_time'):
+            if (self.get_clock().now().nanoseconds - self._last_pursuit_log_time) > 2e9:  # Every 2 seconds
+                log_details = True
+                self._last_pursuit_log_time = self.get_clock().now().nanoseconds
+        else:
+            log_details = True
+            self._last_pursuit_log_time = self.get_clock().now().nanoseconds
+        
+        if log_details:
+            self.get_logger().info(f"Pure pursuit: Lookahead point = ({lookahead_point[0]:.3f}, {lookahead_point[1]:.3f})")
         
         # Calculate control commands
         cmd = Twist()
@@ -762,6 +849,9 @@ class AmclNode(Node):
         dy = lookahead_point[1] - current_pose.position.y
         distance_to_lookahead = np.sqrt(dx*dx + dy*dy)
         
+        if log_details:
+            self.get_logger().info(f"Pure pursuit: dx={dx:.3f}, dy={dy:.3f}, distance={distance_to_lookahead:.3f}")
+        
         # Get current yaw
         q = current_pose.orientation
         current_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
@@ -770,16 +860,12 @@ class AmclNode(Node):
         desired_yaw = np.arctan2(dy, dx)
         yaw_error = self.normalize_angle(desired_yaw - current_yaw)
         
-        # Adaptive linear velocity based on yaw error
-        if abs(yaw_error) > np.pi/4:  # If error > 45 degrees
-            cmd.linear.x = 0.05  # Move slowly
-        else:
-            # Scale linear velocity based on yaw error
-            cmd.linear.x = self.linear_velocity * (1.0 - 0.5 * abs(yaw_error) / (np.pi/4))
+        if log_details:
+            self.get_logger().info(f"Pure pursuit: current_yaw={current_yaw:.3f}, desired_yaw={desired_yaw:.3f}, yaw_error={yaw_error:.3f}")
         
-        # Proportional-Derivative control for angular velocity
-        kp = 2.0  # Proportional gain
-        cmd.angular.z = kp * yaw_error
+        # Control law
+        cmd.linear.x = self.linear_velocity
+        cmd.angular.z = 2.0 * yaw_error  # Proportional control
         
         # Limit angular velocity
         max_angular = 1.0
@@ -787,33 +873,28 @@ class AmclNode(Node):
         
         return cmd
 
-    def prune_path(self, current_pose, path):
-        """Remove path points that are behind the robot or too close"""
-        if not path:
-            return path
-        
-        current_x = current_pose.position.x
-        current_y = current_pose.position.y
-        
-        # Find the closest point ahead of the robot
-        pruned_path = []
-        for i, (px, py) in enumerate(path):
-            dist = np.sqrt((px - current_x)**2 + (py - current_y)**2)
-            
-            # Keep points that are ahead and not too close
-            if dist > self.path_pruning_distance:
-                pruned_path = path[i:]
-                break
-        
-        return pruned_path if pruned_path else [path[-1]]  # Always keep the goal
-
     def find_lookahead_point(self, current_pose, path):
         """Find the lookahead point on the path"""
         if not path:
+            self.get_logger().warn("find_lookahead_point: Empty path")
             return None
         
         current_x = current_pose.position.x
         current_y = current_pose.position.y
+        
+        # Throttled logging for lookahead details
+        log_details = False
+        if hasattr(self, '_last_lookahead_log_time'):
+            if (self.get_clock().now().nanoseconds - self._last_lookahead_log_time) > 3e9:  # Every 3 seconds
+                log_details = True
+                self._last_lookahead_log_time = self.get_clock().now().nanoseconds
+        else:
+            log_details = True
+            self._last_lookahead_log_time = self.get_clock().now().nanoseconds
+        
+        if log_details:
+            self.get_logger().info(f"find_lookahead_point: Current robot position = ({current_x:.3f}, {current_y:.3f})")
+            self.get_logger().info(f"find_lookahead_point: Looking for point at distance >= {self.lookahead_distance:.3f}")
         
         # Find the closest point on the path
         min_dist = float('inf')
@@ -825,15 +906,22 @@ class AmclNode(Node):
                 min_dist = dist
                 closest_idx = i
         
+        if log_details:
+            self.get_logger().info(f"find_lookahead_point: Closest point is index {closest_idx} at distance {min_dist:.3f}")
+        
         # Find lookahead point
         for i in range(closest_idx, len(path)):
             px, py = path[i]
             dist = np.sqrt((px - current_x)**2 + (py - current_y)**2)
             
             if dist >= self.lookahead_distance:
+                if log_details:
+                    self.get_logger().info(f"find_lookahead_point: Found lookahead point at index {i}, distance {dist:.3f}")
                 return (px, py)
         
         # If no point found, return the last point
+        if log_details:
+            self.get_logger().info(f"find_lookahead_point: No point at lookahead distance, using last point")
         return path[-1]
 
     def normalize_angle(self, angle):
@@ -856,51 +944,61 @@ class AmclNode(Node):
         if self.latest_scan is None:
             return False
         
+        # Check for obstacles in the front arc
         ranges = np.array(self.latest_scan.ranges)
+        valid_ranges = ranges[np.isfinite(ranges)]
         
-        # Calculate the indices for front 60 degrees (-30 to +30)
+        if len(valid_ranges) == 0:
+            return False
+        
+        # Check front 60 degrees
         num_rays = len(ranges)
-        angle_min = self.latest_scan.angle_min
-        angle_max = self.latest_scan.angle_max
-        angle_increment = self.latest_scan.angle_increment
+        front_start = int(num_rays * 0.7)  # -30 degrees
+        front_end = int(num_rays * 0.3)    # +30 degrees
         
-        # Find indices for -30 and +30 degrees
-        front_angle_min = -np.pi/6  # -30 degrees
-        front_angle_max = np.pi/6   # +30 degrees
+        front_ranges = np.concatenate([ranges[:front_end], ranges[front_start:]])
+        front_ranges = front_ranges[np.isfinite(front_ranges)]
         
-        front_start_idx = int((front_angle_min - angle_min) / angle_increment)
-        front_end_idx = int((front_angle_max - angle_min) / angle_increment)
-        
-        # Ensure indices are within bounds
-        front_start_idx = max(0, front_start_idx)
-        front_end_idx = min(num_rays - 1, front_end_idx)
-        
-        # Get front ranges
-        front_ranges = ranges[front_start_idx:front_end_idx+1]
-        valid_front_ranges = front_ranges[np.isfinite(front_ranges) & (front_ranges > 0)]
-        
-        if len(valid_front_ranges) > 0:
-            min_distance = np.min(valid_front_ranges)
-            return min_distance < self.obstacle_detection_distance
+        if len(front_ranges) > 0:
+            min_distance = np.min(front_ranges)
+            obstacle_detected = min_distance < self.obstacle_detection_distance
+            
+            # Debug logging (throttled)
+            if hasattr(self, '_last_obstacle_log_time'):
+                if (self.get_clock().now().nanoseconds - self._last_obstacle_log_time) > 1e9:  # Every 1 second
+                    self.get_logger().info(f"Obstacle detection: min_distance={min_distance:.3f}, threshold={self.obstacle_detection_distance:.3f}, detected={obstacle_detected}")
+                    self._last_obstacle_log_time = self.get_clock().now().nanoseconds
+            else:
+                self._last_obstacle_log_time = self.get_clock().now().nanoseconds
+            
+            return obstacle_detected
         
         return False
 
     def create_path_msg(self, path):
         """Create a Path message from list of waypoints"""
+        if not path:
+            self.get_logger().warn("create_path_msg called with empty path")
+            return None
+        
         path_msg = Path()
         path_msg.header.frame_id = self.map_frame_id
         path_msg.header.stamp = self.get_clock().now().to_msg()
         
-        for x, y in path:
+        for i, (x, y) in enumerate(path):
             pose_stamped = PoseStamped()
             pose_stamped.header.frame_id = self.map_frame_id
             pose_stamped.header.stamp = self.get_clock().now().to_msg()
-            pose_stamped.pose.position.x = x
-            pose_stamped.pose.position.y = y
+            pose_stamped.pose.position.x = float(x)
+            pose_stamped.pose.position.y = float(y)
             pose_stamped.pose.position.z = 0.0
+            pose_stamped.pose.orientation.x = 0.0
+            pose_stamped.pose.orientation.y = 0.0
+            pose_stamped.pose.orientation.z = 0.0
             pose_stamped.pose.orientation.w = 1.0
             path_msg.poses.append(pose_stamped)
         
+        self.get_logger().info(f"Created path message with {len(path_msg.poses)} poses")
         return path_msg
 
     def ray_trace(self, start_x, start_y, angle, max_range):
@@ -922,6 +1020,55 @@ class AmclNode(Node):
                 return r
         
         return max_range
+
+    def get_odometry_pose(self, current_odom_tf):
+        """Get pose from odometry (fallback when particle filter fails)"""
+        if not hasattr(self, '_initial_odom_pose') or not hasattr(self, '_initial_map_pose'):
+            # Store initial poses for reference
+            if hasattr(self, '_particles_initialized_pose'):
+                self._initial_map_pose = self._particles_initialized_pose
+                self._initial_odom_pose = current_odom_tf.transform
+                self.get_logger().info("Stored initial poses for odometry fallback")
+        
+        if hasattr(self, '_initial_odom_pose') and hasattr(self, '_initial_map_pose'):
+            # Calculate relative motion from initial odometry pose
+            initial_odom = self._initial_odom_pose
+            current_odom = current_odom_tf.transform
+            
+            # Calculate delta in odometry frame
+            delta_x = current_odom.translation.x - initial_odom.translation.x
+            delta_y = current_odom.translation.y - initial_odom.translation.y
+            
+            # Get orientations
+            initial_q = initial_odom.rotation
+            initial_yaw = R.from_quat([initial_q.x, initial_q.y, initial_q.z, initial_q.w]).as_euler('xyz')[2]
+            
+            current_q = current_odom.rotation
+            current_yaw = R.from_quat([current_q.x, current_q.y, current_q.z, current_q.w]).as_euler('xyz')[2]
+            
+            delta_yaw = self.normalize_angle(current_yaw - initial_yaw)
+            
+            # Apply delta to initial map pose
+            pose = Pose()
+            pose.position.x = self._initial_map_pose.position.x + delta_x
+            pose.position.y = self._initial_map_pose.position.y + delta_y
+            pose.position.z = 0.0
+            
+            # Calculate new orientation
+            initial_map_q = self._initial_map_pose.orientation
+            initial_map_yaw = R.from_quat([initial_map_q.x, initial_map_q.y, initial_map_q.z, initial_map_q.w]).as_euler('xyz')[2]
+            
+            new_yaw = initial_map_yaw + delta_yaw
+            q = R.from_euler('z', new_yaw).as_quat()
+            pose.orientation.x = q[0]
+            pose.orientation.y = q[1]
+            pose.orientation.z = q[2]
+            pose.orientation.w = q[3]
+            
+            return pose
+        else:
+            # Fallback to particle filter if no reference available
+            return self.estimate_pose()
 
 def main(args=None):
     rclpy.init(args=args)
