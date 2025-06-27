@@ -20,7 +20,6 @@ class State(Enum):
     NAVIGATING = 2
     AVOIDING_OBSTACLE = 3
 
-
 class AmclNode(Node):
     def __init__(self):
         super().__init__('my_py_amcl')
@@ -38,23 +37,22 @@ class AmclNode(Node):
         self.declare_parameter('obstacle_detection_distance', 0.3)
         self.declare_parameter('obstacle_avoidance_turn_speed', 0.5)
 
-
         # --- Parameters to set ---
         # TODO: Setear valores default
-        self.declare_parameter('num_particles', 10) #empezamos con pocas, de ultima subimos dsp
-        self.declare_parameter('alpha1', 0.1)
-        self.declare_parameter('alpha2', 0.1)
-        self.declare_parameter('alpha3', 0.01)
-        self.declare_parameter('alpha4', 0.01)
+        self.declare_parameter('num_particles', 500)
+        self.declare_parameter('alpha1', 0.2)
+        self.declare_parameter('alpha2', 0.2)
+        self.declare_parameter('alpha3', 0.2)
+        self.declare_parameter('alpha4', 0.2)
         self.declare_parameter('z_hit', 0.8)
         self.declare_parameter('z_rand', 0.2)
-        self.declare_parameter('lookahead_distance', 1)
+        self.declare_parameter('lookahead_distance', 0.5)
         self.declare_parameter('linear_velocity', 0.2)
-        self.declare_parameter('goal_tolerance', 0.1)
-        self.declare_parameter('path_pruning_distance', 0.2)
+        self.declare_parameter('goal_tolerance', 0.2)
+        self.declare_parameter('path_pruning_distance', 0.3)
         self.declare_parameter('safety_margin_cells', 2)
-        #FIN DEL TODO
 
+        
         
         self.num_particles = self.get_parameter('num_particles').value
         self.odom_frame_id = self.get_parameter('odom_frame_id').value
@@ -114,24 +112,6 @@ class AmclNode(Node):
 
         self.timer = self.create_timer(0.1, self.timer_callback)
         self.get_logger().info('MyPyAMCL node initialized.')
-    
-    #IMPLEMENTADO NUESTRO
-    def inflate_map(self):
-        if self.map_data is None:
-            self.get_logger().warn("Cannot inflate map, map data is not available.")
-            return
-        
-        # Create an inflated grid with a safety margin
-        self.inflated_grid = np.copy(self.grid)
-        kernel_size = 2 * self.safety_margin_cells + 1
-        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
-        
-        # Perform dilation to inflate the obstacles
-        from scipy.ndimage import binary_dilation
-        inflated_obstacles = binary_dilation(self.grid > 0, structure=kernel).astype(np.int8)
-        
-        # Update the inflated grid
-        self.inflated_grid[inflated_obstacles > 0] = 100
 
     def map_callback(self, msg):
         if not self.map_received:
@@ -172,53 +152,57 @@ class AmclNode(Node):
         # Deben ser la misma cantidad de particulas que self.num_particles
         # Deben tener un peso
         
+        # Extract initial position and orientation
         x = initial_pose.position.x
         y = initial_pose.position.y
         q = initial_pose.orientation
-        yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
+        initial_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
         
-        position_std = 0.1  
-        orientation_std = 0.1  
+        # Initialize particles around the initial pose with Gaussian noise
+        std_xy = 0.5  # Standard deviation for position (meters)
+        std_yaw = 0.3  # Standard deviation for orientation (radians)
         
-        self.particles[:, 0] = np.random.normal(x, position_std, self.num_particles)
-        self.particles[:, 1] = np.random.normal(y, position_std, self.num_particles)
-        self.particles[:, 2] = np.random.normal(yaw, orientation_std, self.num_particles)
+        self.particles[:, 0] = np.random.normal(x, std_xy, self.num_particles)
+        self.particles[:, 1] = np.random.normal(y, std_xy, self.num_particles)
+        self.particles[:, 2] = np.random.normal(initial_yaw, std_yaw, self.num_particles)
         
+        # Normalize angles to [-pi, pi]
+        self.particles[:, 2] = np.arctan2(np.sin(self.particles[:, 2]), np.cos(self.particles[:, 2]))
+        
+        # Initialize uniform weights
         self.weights = np.ones(self.num_particles) / self.num_particles
 
-        self.publish_particles()  
+        self.publish_particles()
 
     def initialize_particles_randomly(self):
         # TODO: Inizializar particulas aleatoriamente en todo el mapa
-        if self.map_data is None:
-            self.get_logger().warn("Cannot initialize particles randomly, map data is not available.")
-            return
         
-        map_w = self.map_data.info.width
-        map_h = self.map_data.info.height
-        resolution = self.map_data.info.resolution
-        origin_x = self.map_data.info.origin.position.x
-        origin_y = self.map_data.info.origin.position.y
-        
-        free_cells = []
-        for y in range(map_h):
-            for x in range(map_w):
-                if self.grid[y, x] <= 65:  # Free space si esta abajo del 0.65
-                    world_x = x * resolution + origin_x
-                    world_y = y * resolution + origin_y
-                    free_cells.append((world_x, world_y))
-        
-        if len(free_cells) == 0:
-            self.get_logger().warn("No free space found in map for particle initialization")
-            return
+        # Get free space positions from the map
+        free_cells = np.where(self.grid == 0)  # Free space cells
+        if len(free_cells[0]) == 0:
+            self.get_logger().warn("No free space found in map, using default initialization")
+            # Fallback to center of map
+            center_x = self.map_data.info.width / 2
+            center_y = self.map_data.info.height / 2
+            self.particles[:, 0] = center_x * self.map_data.info.resolution + self.map_data.info.origin.position.x
+            self.particles[:, 1] = center_y * self.map_data.info.resolution + self.map_data.info.origin.position.y
+        else:
+            # Randomly sample from free cells
+            num_free = len(free_cells[0])
+            sample_indices = np.random.choice(num_free, self.num_particles, replace=True)
             
-        selected_indices = np.random.choice(len(free_cells), self.num_particles, replace=True)
+            # Convert grid coordinates to world coordinates
+            for i in range(self.num_particles):
+                gx = free_cells[1][sample_indices[i]]  # x is columns (width)
+                gy = free_cells[0][sample_indices[i]]  # y is rows (height)
+                wx, wy = self.grid_to_world(gx, gy)
+                self.particles[i, 0] = wx
+                self.particles[i, 1] = wy
         
-        for i, idx in enumerate(selected_indices):
-            self.particles[i, 0] = free_cells[idx][0]
-            self.particles[i, 1] = free_cells[idx][1]
-            self.particles[i, 2] = np.random.uniform(-np.pi, np.pi)
+        # Random orientations
+        self.particles[:, 2] = np.random.uniform(-np.pi, np.pi, self.num_particles)
         
+        # Initialize uniform weights
         self.weights = np.ones(self.num_particles) / self.num_particles
 
         self.publish_particles()
@@ -244,150 +228,93 @@ class AmclNode(Node):
                 self.stop_robot()
             return
 
-        # Update particles with motion model if we have previous odometry
+        # Update particle filter
         if self.last_odom_pose is not None:
             self.motion_model(current_odom_tf)
-        
-        # Update particle weights with measurement model
         self.measurement_model()
-        
-        # Resample particles if needed
         self.resample()
-        
-        # Estimate current pose
         estimated_pose = self.estimate_pose()
-        
-        # State machine implementation
-        if self.state == State.IDLE:
-            # Robot is idle, waiting for a goal
-            pass
-            
-        elif self.state == State.PLANNING:
-            # Plan path to goal
+
+        # State machine for navigation
+        if self.state == State.PLANNING:
             if self.goal_pose is not None:
-                # TODO: Implement path planning here
-                # For now, just transition to NAVIGATING
-                self.get_logger().info("Planning complete. State -> NAVIGATING")
-                self.state = State.NAVIGATING
-                
-        elif self.state == State.NAVIGATING:
-            # Navigate along planned path
-            if self.goal_pose is not None:
-                # Check if goal is reached
-                goal_distance = np.sqrt(
-                    (estimated_pose.position.x - self.goal_pose.position.x)**2 + 
-                    (estimated_pose.position.y - self.goal_pose.position.y)**2
-                )
-                
-                if goal_distance < self.goal_tolerance:
-                    self.get_logger().info("Goal reached! State -> IDLE")
-                    self.state = State.IDLE
-                    self.goal_pose = None
-                    self.stop_robot()
+                path = self.a_star_planning(estimated_pose, self.goal_pose)
+                if path is not None:
+                    self.current_path = path
+                    self.state = State.NAVIGATING
+                    self.get_logger().info("Path planned successfully. State -> NAVIGATING")
+                    # Publish path for visualization
+                    path_msg = self.create_path_msg(path)
+                    self.publish_path(path_msg)
                 else:
-                    # Check for obstacles
-                    if self.detect_obstacle():
-                        self.get_logger().info("Obstacle detected! State -> AVOIDING_OBSTACLE")
-                        self.state = State.AVOIDING_OBSTACLE
-                        self.obstacle_avoidance_active = True
-                    else:
-                        # Continue navigation
-                        self.navigate_to_goal(estimated_pose)
-                        
+                    self.get_logger().error("Failed to plan path. State -> IDLE")
+                    self.state = State.IDLE
+                    self.stop_robot()
+
+        elif self.state == State.NAVIGATING:
+            if self.current_path is None:
+                self.state = State.IDLE
+                self.stop_robot()
+                return
+
+            # Check if goal is reached
+            goal_distance = self.distance_to_goal(estimated_pose, self.goal_pose)
+            if goal_distance < self.goal_tolerance:
+                self.get_logger().info("Goal reached! State -> IDLE")
+                self.state = State.IDLE
+                self.stop_robot()
+                return
+
+            # Check for obstacles
+            if self.detect_obstacle():
+                self.get_logger().warn("Obstacle detected. State -> AVOIDING_OBSTACLE")
+                self.state = State.AVOIDING_OBSTACLE
+                self.obstacle_avoidance_active = True
+                q = estimated_pose.orientation
+                self.obstacle_avoidance_start_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
+                self.obstacle_avoidance_cumulative_angle = 0.0
+                return
+
+            # Follow path using pure pursuit
+            cmd = self.pure_pursuit_control(estimated_pose, self.current_path)
+            self.cmd_vel_pub.publish(cmd)
+
         elif self.state == State.AVOIDING_OBSTACLE:
-            # Avoid obstacle
             if not self.detect_obstacle():
+                # Clear path, return to navigation
                 self.get_logger().info("Obstacle cleared. State -> NAVIGATING")
                 self.state = State.NAVIGATING
                 self.obstacle_avoidance_active = False
-            else:
-                self.avoid_obstacle()
+                return
+
+            # Simple obstacle avoidance: turn left
+            cmd = Twist()
+            cmd.linear.x = 0.05  # Move slowly forward
+            cmd.angular.z = self.obstacle_avoidance_turn_speed
+            self.cmd_vel_pub.publish(cmd)
+
+            # Track rotation to avoid infinite spinning
+            q = estimated_pose.orientation
+            current_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
+            
+            if self.obstacle_avoidance_last_yaw is not None:
+                angle_diff = self.normalize_angle(current_yaw - self.obstacle_avoidance_last_yaw)
+                self.obstacle_avoidance_cumulative_angle += abs(angle_diff)
+            
+            self.obstacle_avoidance_last_yaw = current_yaw
+            
+            # If we've turned too much, try replanning
+            if self.obstacle_avoidance_cumulative_angle > 2 * np.pi:
+                self.get_logger().warn("Obstacle avoidance timeout. State -> PLANNING")
+                self.state = State.PLANNING
+                self.obstacle_avoidance_active = False
 
         # TODO: Implementar codigo para publicar la pose estimada, las particulas, y la transformacion entre el mapa y la base del robot.
+
         self.publish_pose(estimated_pose)
         self.publish_particles()
         self.publish_transform(estimated_pose, current_odom_tf)
 
-    # ========== HELPER FUNCTIONS PARA TIMER CALLBACK ============
-    def stop_robot(self):
-        """Stop the robot by publishing zero velocities"""
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        self.cmd_vel_pub.publish(twist)
-
-    def detect_obstacle(self):
-        """Detect obstacles using laser scan data"""
-        if self.latest_scan is None:
-            return False
-        
-        # Check front-facing laser readings for obstacles
-        front_ranges = []
-        total_readings = len(self.latest_scan.ranges)
-        front_arc = int(total_readings * 0.2)  # 20% of readings in front
-        
-        # Get front readings (center ± front_arc/2)
-        center = total_readings // 2
-        start = center - front_arc // 2
-        end = center + front_arc // 2
-        
-        for i in range(start, end):
-            if i >= 0 and i < total_readings:
-                range_val = self.latest_scan.ranges[i]
-                if not np.isinf(range_val) and not np.isnan(range_val):
-                    front_ranges.append(range_val)
-        
-        if front_ranges:
-            min_distance = min(front_ranges)
-            return min_distance < self.obstacle_detection_distance
-        
-        return False
-
-    def navigate_to_goal(self, current_pose):
-        """Navigate towards the goal using simple goal-seeking behavior"""
-        if self.goal_pose is None:
-            return
-        
-        # Calculate distance and angle to goal
-        dx = self.goal_pose.position.x - current_pose.position.x
-        dy = self.goal_pose.position.y - current_pose.position.y
-        
-        # Get current yaw
-        q = current_pose.orientation
-        current_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
-        
-        # Calculate desired yaw
-        desired_yaw = np.arctan2(dy, dx)
-        yaw_error = desired_yaw - current_yaw
-        
-        # Normalize angle
-        while yaw_error > np.pi:
-            yaw_error -= 2 * np.pi
-        while yaw_error < -np.pi:
-            yaw_error += 2 * np.pi
-        
-        # Create velocity command
-        twist = Twist()
-        
-        # Angular velocity (proportional control)
-        twist.angular.z = 2.0 * yaw_error
-        
-        # Linear velocity (only move forward if roughly facing the goal)
-        if abs(yaw_error) < 0.5:  # Within 30 degrees
-            twist.linear.x = self.linear_velocity
-        else:
-            twist.linear.x = 0.0
-        
-        self.cmd_vel_pub.publish(twist)
-
-    def avoid_obstacle(self):
-        """Simple obstacle avoidance by turning"""
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = self.obstacle_avoidance_turn_speed
-        self.cmd_vel_pub.publish(twist)
-    
-    #  ========== FIN DE LAS HELPER FUNCTIONS PARA TIMER CALLBACK ===========
 
     def get_odom_transform(self):
         try:
@@ -401,61 +328,48 @@ class AmclNode(Node):
         
         # TODO: Implementar el modelo de movimiento para actualizar las particulas.
         
-        # Extract current position and orientation
-        curr_x = current_odom_pose.translation.x
-        curr_y = current_odom_pose.translation.y
-        curr_q = current_odom_pose.rotation
-        curr_yaw = R.from_quat([curr_q.x, curr_q.y, curr_q.z, curr_q.w]).as_euler('xyz')[2]
+        # Calculate odometry change
+        if self.last_odom_pose is None:
+            self.last_odom_pose = current_odom_pose
+            return
         
-        # Extract previous position and orientation
+        # Extract positions and orientations
         prev_x = self.last_odom_pose.translation.x
         prev_y = self.last_odom_pose.translation.y
         prev_q = self.last_odom_pose.rotation
         prev_yaw = R.from_quat([prev_q.x, prev_q.y, prev_q.z, prev_q.w]).as_euler('xyz')[2]
         
-        # Calculate odometry motion
+        curr_x = current_odom_pose.translation.x
+        curr_y = current_odom_pose.translation.y
+        curr_q = current_odom_pose.rotation
+        curr_yaw = R.from_quat([curr_q.x, curr_q.y, curr_q.z, curr_q.w]).as_euler('xyz')[2]
+        
+        # Calculate odometry deltas
         delta_x = curr_x - prev_x
         delta_y = curr_y - prev_y
-        delta_yaw = curr_yaw - prev_yaw
+        delta_yaw = self.normalize_angle(curr_yaw - prev_yaw)
         
-        # Normalize angle difference
-        while delta_yaw > np.pi:
-            delta_yaw -= 2 * np.pi
-        while delta_yaw < -np.pi:
-            delta_yaw += 2 * np.pi
-            
-        # Calculate motion in robot's local frame
+        # Calculate motion parameters
         delta_trans = np.sqrt(delta_x**2 + delta_y**2)
-        delta_rot1 = np.arctan2(delta_y, delta_x) - prev_yaw
-        delta_rot2 = delta_yaw - delta_rot1
+        delta_rot1 = self.normalize_angle(np.arctan2(delta_y, delta_x) - prev_yaw)
+        delta_rot2 = self.normalize_angle(delta_yaw - delta_rot1)
         
-        # Normalize angles
-        while delta_rot1 > np.pi:
-            delta_rot1 -= 2 * np.pi
-        while delta_rot1 < -np.pi:
-            delta_rot1 += 2 * np.pi
-        while delta_rot2 > np.pi:
-            delta_rot2 -= 2 * np.pi
-        while delta_rot2 < -np.pi:
-            delta_rot2 += 2 * np.pi
+        # Skip if no significant motion
+        if delta_trans < 0.01 and abs(delta_yaw) < 0.01:
+            self.last_odom_pose = current_odom_pose
+            return
         
-        # Apply motion model to each particle with noise
+        # Apply motion model to each particle
         for i in range(self.num_particles):
-            # Add noise to motion commands based on alpha parameters
+            # Add noise to motion parameters
             noisy_rot1 = delta_rot1 + np.random.normal(0, self.alphas[0] * abs(delta_rot1) + self.alphas[1] * delta_trans)
             noisy_trans = delta_trans + np.random.normal(0, self.alphas[2] * delta_trans + self.alphas[3] * (abs(delta_rot1) + abs(delta_rot2)))
             noisy_rot2 = delta_rot2 + np.random.normal(0, self.alphas[0] * abs(delta_rot2) + self.alphas[1] * delta_trans)
             
-            # Update particle position
+            # Update particle pose
             self.particles[i, 0] += noisy_trans * np.cos(self.particles[i, 2] + noisy_rot1)
             self.particles[i, 1] += noisy_trans * np.sin(self.particles[i, 2] + noisy_rot1)
-            self.particles[i, 2] += noisy_rot1 + noisy_rot2
-            
-            # Normalize particle angle
-            while self.particles[i, 2] > np.pi:
-                self.particles[i, 2] -= 2 * np.pi
-            while self.particles[i, 2] < -np.pi:
-                self.particles[i, 2] += 2 * np.pi
+            self.particles[i, 2] = self.normalize_angle(self.particles[i, 2] + noisy_rot1 + noisy_rot2)
         
         self.last_odom_pose = current_odom_pose
 
@@ -466,155 +380,122 @@ class AmclNode(Node):
         map_h = self.map_data.info.height
         map_img = np.array(self.map_data.data).reshape((map_h, map_w))
 
+        if self.latest_scan is None:
+            return
+
         # Get laser scan parameters
+        ranges = np.array(self.latest_scan.ranges)
         angle_min = self.latest_scan.angle_min
         angle_increment = self.latest_scan.angle_increment
-        ranges = np.array(self.latest_scan.ranges)
+        range_max = min(self.latest_scan.range_max, self.laser_max_range)
         
-        # Skip invalid ranges and subsample for performance
-        valid_indices = []
-        for i, r in enumerate(ranges):
-            if not np.isinf(r) and not np.isnan(r) and r > 0 and r < self.laser_max_range:
-                valid_indices.append(i)
-        
-        # Subsample laser readings for computational efficiency (every 5th reading)
-        valid_indices = valid_indices[::5]
+        # Filter valid measurements
+        valid_indices = np.where((ranges > 0) & (ranges < range_max) & np.isfinite(ranges))[0]
         
         if len(valid_indices) == 0:
-            return  # No valid laser readings
-        
+            return
+
         # TODO: Implementar el modelo de medición para actualizar los pesos de las particulas por particula
         
-        # Update weight for each particle
-        for p_idx in range(self.num_particles):
-            particle_x = self.particles[p_idx, 0]
-            particle_y = self.particles[p_idx, 1]
-            particle_theta = self.particles[p_idx, 2]
+        # Process each particle
+        for i in range(self.num_particles):
+            particle_x = self.particles[i, 0]
+            particle_y = self.particles[i, 1]
+            particle_yaw = self.particles[i, 2]
             
-            log_likelihood = 0.0
+            weight = 1.0
             
-            # Process each laser beam
-            for beam_idx in valid_indices:
-                # Calculate beam angle in world frame
-                beam_angle = angle_min + beam_idx * angle_increment + particle_theta
-                
-                # Actual measured distance
-                z_measured = ranges[beam_idx]
-                
-                # Calculate expected distance by ray casting in the map
-                z_expected = self.ray_cast(particle_x, particle_y, beam_angle, map_img, map_res, map_origin, map_w, map_h)
-                
-                # Calculate likelihood using beam model
-                if z_expected is not None:
-                    # Hit probability (Gaussian around expected distance)
-                    diff = z_measured - z_expected
-                    p_hit = np.exp(-0.5 * (diff / 0.2)**2)  # sigma = 0.2m
-                    
-                    # Random probability (uniform)
-                    p_rand = 1.0 / self.laser_max_range
-                    
-                    # Combined probability
-                    p_total = self.z_hit * p_hit + self.z_rand * p_rand
-                    
-                    # Add log likelihood (avoid log(0))
-                    if p_total > 1e-8:
-                        log_likelihood += np.log(p_total)
-                    else:
-                        log_likelihood += np.log(1e-8)
+            # Sample a subset of rays for efficiency
+            step = max(1, len(valid_indices) // 20)  # Use max 20 rays
             
-            # Update particle weight
-            self.weights[p_idx] = np.exp(log_likelihood)
+            for j in valid_indices[::step]:
+                measured_range = ranges[j]
+                ray_angle = angle_min + j * angle_increment + particle_yaw
+                
+                # Ray tracing to find expected range
+                expected_range = self.ray_trace(particle_x, particle_y, ray_angle, range_max)
+                
+                if expected_range > 0:
+                    # Likelihood based on range difference
+                    range_diff = abs(measured_range - expected_range)
+                    
+                    # Simple likelihood model
+                    if range_diff < 0.1:  # Hit
+                        weight *= self.z_hit
+                    else:  # Miss or random
+                        weight *= self.z_rand / range_max
+            
+            self.weights[i] = weight
         
         # Normalize weights
         weight_sum = np.sum(self.weights)
         if weight_sum > 0:
             self.weights /= weight_sum
         else:
-            # If all weights are zero, reset to uniform
             self.weights = np.ones(self.num_particles) / self.num_particles
-    # ============ HELPER FUNCTION PARA EL MEASURMENT MODEL =============
-    def ray_cast(self, start_x, start_y, angle, map_img, resolution, origin, map_w, map_h):
-        """Cast a ray from start position at given angle until hitting obstacle or max range"""
-        # Ray casting parameters
-        step_size = resolution * 0.5  # Half resolution for accuracy
-        max_steps = int(self.laser_max_range / step_size)
-        
-        # Ray direction
-        dx = np.cos(angle) * step_size
-        dy = np.sin(angle) * step_size
-        
-        # Current position
-        curr_x = start_x
-        curr_y = start_y
-        
-        for step in range(max_steps):
-            # Convert world coordinates to grid coordinates
-            grid_x = int((curr_x - origin.x) / resolution)
-            grid_y = int((curr_y - origin.y) / resolution)
-            
-            # Check bounds
-            if grid_x < 0 or grid_x >= map_w or grid_y < 0 or grid_y >= map_h:
-                break
-            
-            # Check if hit obstacle (occupied cell > 50)
-            if map_img[grid_y, grid_x] > 50:
-                # Calculate distance from start to hit point
-                distance = np.sqrt((curr_x - start_x)**2 + (curr_y - start_y)**2)
-                return distance
-            
-            # Move along ray
-            curr_x += dx
-            curr_y += dy
-        
-        # No obstacle hit within max range
-        return self.laser_max_range
 
     def resample(self):
         # TODO: Implementar el resampleo de las particulas basado en los pesos.
+        
+        # Calculate effective sample size
         eff_sample_size = 1.0 / np.sum(self.weights**2)
         
         # Only resample if effective sample size is too low
-        if eff_sample_size < self.num_particles / 2.0:
+        if eff_sample_size < self.num_particles / 2:
             # Low variance resampling
             new_particles = np.zeros_like(self.particles)
-            cumulative_weights = np.cumsum(self.weights)
             
-            # Generate random offset
-            r = np.random.uniform(0, 1.0 / self.num_particles)
+            # Generate cumulative sum
+            cumsum = np.cumsum(self.weights)
+            
+            # Generate random starting point
+            r = np.random.uniform(0, 1.0/self.num_particles)
             
             i = 0
-            for m in range(self.num_particles):
-                u = r + m / self.num_particles
-                while u > cumulative_weights[i]:
-                    i += 1
-                new_particles[m] = self.particles[i].copy()
+            for j in range(self.num_particles):
+                u = r + j / self.num_particles
                 
+                # Find particle to resample
+                while u > cumsum[i]:
+                    i += 1
+                
+                new_particles[j] = self.particles[i].copy()
+            
             self.particles = new_particles
             self.weights = np.ones(self.num_particles) / self.num_particles
 
     def estimate_pose(self):
         # TODO: Implementar la estimación de pose a partir de las particulas y sus pesos.
-        weighted_x = np.sum(self.particles[:, 0] * self.weights)
-        weighted_y = np.sum(self.particles[:, 1] * self.weights)
         
-        # For angle, use circular mean
-        cos_sum = np.sum(np.cos(self.particles[:, 2]) * self.weights)
-        sin_sum = np.sum(np.sin(self.particles[:, 2]) * self.weights)
-        weighted_yaw = np.arctan2(sin_sum, cos_sum)
+        # Weighted average of particles
+        if np.sum(self.weights) == 0:
+            # If all weights are zero, use uniform weights
+            weights = np.ones(self.num_particles) / self.num_particles
+        else:
+            weights = self.weights / np.sum(self.weights)
+        
+        # Calculate weighted position
+        x = np.sum(weights * self.particles[:, 0])
+        y = np.sum(weights * self.particles[:, 1])
+        
+        # Calculate weighted orientation (using circular statistics)
+        cos_sum = np.sum(weights * np.cos(self.particles[:, 2]))
+        sin_sum = np.sum(weights * np.sin(self.particles[:, 2]))
+        yaw = np.arctan2(sin_sum, cos_sum)
         
         # Create pose message
         pose = Pose()
-        pose.position.x = weighted_x
-        pose.position.y = weighted_y
+        pose.position.x = x
+        pose.position.y = y
         pose.position.z = 0.0
         
         # Convert yaw to quaternion
-        q = R.from_euler('z', weighted_yaw).as_quat()
+        q = R.from_euler('z', yaw).as_quat()
         pose.orientation.x = q[0]
         pose.orientation.y = q[1]
         pose.orientation.z = q[2]
         pose.orientation.w = q[3]
-
+        
         return pose
 
     def publish_pose(self, estimated_pose):
@@ -655,21 +536,19 @@ class AmclNode(Node):
         
         # TODO: Completar el TransformStamped con la transformacion entre el mapa y la base del robot.
         
-        # Set header information
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = self.map_frame_id
         t.child_frame_id = self.odom_frame_id
         
-        # Extract translation from transformation matrix
+        # Extract translation
         t.transform.translation.x = map_to_odom_mat[0, 3]
         t.transform.translation.y = map_to_odom_mat[1, 3]
         t.transform.translation.z = map_to_odom_mat[2, 3]
         
-        # Extract rotation from transformation matrix and convert to quaternion
+        # Extract rotation
         rotation_matrix = map_to_odom_mat[:3, :3]
         r = R.from_matrix(rotation_matrix)
-        q = r.as_quat()  # Returns [x, y, z, w]
-        
+        q = r.as_quat()
         t.transform.rotation.x = q[0]
         t.transform.rotation.y = q[1]
         t.transform.rotation.z = q[2]
@@ -710,7 +589,286 @@ class AmclNode(Node):
         path_msg.header.frame_id = self.map_frame_id
         self.path_pub.publish(path_msg)
 
-    
+    def inflate_map(self):
+        """Inflate the map for safe navigation"""
+        if self.grid is None:
+            return
+        
+        # Create inflated map by dilating obstacles
+        from scipy.ndimage import binary_dilation
+        
+        # Convert occupancy grid to binary (obstacle/free)
+        obstacle_mask = self.grid > 50  # Cells with >50% probability are obstacles
+        
+        # Create structuring element for inflation
+        struct_size = self.safety_margin_cells * 2 + 1
+        struct = np.ones((struct_size, struct_size))
+        
+        # Inflate obstacles
+        inflated_mask = binary_dilation(obstacle_mask, structure=struct)
+        
+        # Convert back to occupancy grid format
+        self.inflated_grid = np.zeros_like(self.grid)
+        self.inflated_grid[inflated_mask] = 100
+        self.inflated_grid[self.grid == -1] = -1  # Keep unknown cells
+
+    def a_star_planning(self, start_pose, goal_pose):
+        """A* path planning algorithm"""
+        start_gx, start_gy = self.world_to_grid(start_pose.position.x, start_pose.position.y)
+        goal_gx, goal_gy = self.world_to_grid(goal_pose.position.x, goal_pose.position.y)
+        
+        # Check if start and goal are valid
+        if not self.is_valid_cell(start_gx, start_gy) or not self.is_valid_cell(goal_gx, goal_gy):
+            self.get_logger().error("Start or goal position is invalid")
+            return None
+        
+        # A* implementation
+        open_set = [(0, start_gx, start_gy)]
+        came_from = {}
+        g_score = {(start_gx, start_gy): 0}
+        f_score = {(start_gx, start_gy): self.heuristic(start_gx, start_gy, goal_gx, goal_gy)}
+        
+        directions = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+        
+        while open_set:
+            current_f, current_x, current_y = heapq.heappop(open_set)
+            
+            if current_x == goal_gx and current_y == goal_gy:
+                # Reconstruct path
+                path = []
+                while (current_x, current_y) in came_from:
+                    wx, wy = self.grid_to_world(current_x, current_y)
+                    path.append((wx, wy))
+                    current_x, current_y = came_from[(current_x, current_y)]
+                
+                # Add start position
+                wx, wy = self.grid_to_world(start_gx, start_gy)
+                path.append((wx, wy))
+                path.reverse()
+                
+                return self.smooth_path(path)
+            
+            for dx, dy in directions:
+                neighbor_x, neighbor_y = current_x + dx, current_y + dy
+                
+                if not self.is_valid_cell(neighbor_x, neighbor_y):
+                    continue
+                
+                # Calculate cost (diagonal moves cost more)
+                move_cost = 1.414 if abs(dx) + abs(dy) == 2 else 1.0
+                tentative_g = g_score[(current_x, current_y)] + move_cost
+                
+                if (neighbor_x, neighbor_y) not in g_score or tentative_g < g_score[(neighbor_x, neighbor_y)]:
+                    came_from[(neighbor_x, neighbor_y)] = (current_x, current_y)
+                    g_score[(neighbor_x, neighbor_y)] = tentative_g
+                    f_score[(neighbor_x, neighbor_y)] = tentative_g + self.heuristic(neighbor_x, neighbor_y, goal_gx, goal_gy)
+                    heapq.heappush(open_set, (f_score[(neighbor_x, neighbor_y)], neighbor_x, neighbor_y))
+        
+        return None  # No path found
+
+    def heuristic(self, x1, y1, x2, y2):
+        """Euclidean distance heuristic for A*"""
+        return np.sqrt((x1 - x2)**2 + (y1 - y2)**2)
+
+    def is_valid_cell(self, gx, gy):
+        """Check if grid cell is valid and free"""
+        if gx < 0 or gx >= self.map_data.info.width or gy < 0 or gy >= self.map_data.info.height:
+            return False
+        
+        # Use inflated grid for planning
+        if self.inflated_grid[gy, gx] > 50:  # Obstacle or inflated area
+            return False
+        
+        return True
+
+    def smooth_path(self, path):
+        """Simple path smoothing"""
+        if len(path) <= 2:
+            return path
+        
+        smoothed = [path[0]]
+        
+        for i in range(1, len(path) - 1):
+            # Check if we can skip this waypoint
+            if not self.line_of_sight(smoothed[-1], path[i + 1]):
+                smoothed.append(path[i])
+        
+        smoothed.append(path[-1])
+        return smoothed
+
+    def line_of_sight(self, start, end):
+        """Check if there's a clear line of sight between two points"""
+        x0, y0 = self.world_to_grid(start[0], start[1])
+        x1, y1 = self.world_to_grid(end[0], end[1])
+        
+        # Bresenham's line algorithm
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        
+        x, y = x0, y0
+        
+        while True:
+            if not self.is_valid_cell(x, y):
+                return False
+            
+            if x == x1 and y == y1:
+                break
+            
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x += sx
+            if e2 < dx:
+                err += dx
+                y += sy
+        
+        return True
+
+    def pure_pursuit_control(self, current_pose, path):
+        """Pure pursuit controller for path following"""
+        if not path or len(path) < 2:
+            return Twist()
+        
+        # Find lookahead point
+        lookahead_point = self.find_lookahead_point(current_pose, path)
+        if lookahead_point is None:
+            return Twist()
+        
+        # Calculate control commands
+        cmd = Twist()
+        
+        # Calculate distance and angle to lookahead point
+        dx = lookahead_point[0] - current_pose.position.x
+        dy = lookahead_point[1] - current_pose.position.y
+        
+        # Get current yaw
+        q = current_pose.orientation
+        current_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
+        
+        # Calculate desired heading
+        desired_yaw = np.arctan2(dy, dx)
+        yaw_error = self.normalize_angle(desired_yaw - current_yaw)
+        
+        # Control law
+        cmd.linear.x = self.linear_velocity
+        cmd.angular.z = 2.0 * yaw_error  # Proportional control
+        
+        # Limit angular velocity
+        max_angular = 1.0
+        cmd.angular.z = np.clip(cmd.angular.z, -max_angular, max_angular)
+        
+        return cmd
+
+    def find_lookahead_point(self, current_pose, path):
+        """Find the lookahead point on the path"""
+        if not path:
+            return None
+        
+        current_x = current_pose.position.x
+        current_y = current_pose.position.y
+        
+        # Find the closest point on the path
+        min_dist = float('inf')
+        closest_idx = 0
+        
+        for i, (px, py) in enumerate(path):
+            dist = np.sqrt((px - current_x)**2 + (py - current_y)**2)
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+        
+        # Find lookahead point
+        for i in range(closest_idx, len(path)):
+            px, py = path[i]
+            dist = np.sqrt((px - current_x)**2 + (py - current_y)**2)
+            
+            if dist >= self.lookahead_distance:
+                return (px, py)
+        
+        # If no point found, return the last point
+        return path[-1]
+
+    def normalize_angle(self, angle):
+        """Normalize angle to [-pi, pi]"""
+        return np.arctan2(np.sin(angle), np.cos(angle))
+
+    def stop_robot(self):
+        """Stop the robot"""
+        cmd = Twist()
+        self.cmd_vel_pub.publish(cmd)
+
+    def distance_to_goal(self, current_pose, goal_pose):
+        """Calculate distance to goal"""
+        dx = goal_pose.position.x - current_pose.position.x
+        dy = goal_pose.position.y - current_pose.position.y
+        return np.sqrt(dx*dx + dy*dy)
+
+    def detect_obstacle(self):
+        """Detect obstacles using laser scan"""
+        if self.latest_scan is None:
+            return False
+        
+        # Check for obstacles in the front arc
+        ranges = np.array(self.latest_scan.ranges)
+        valid_ranges = ranges[np.isfinite(ranges)]
+        
+        if len(valid_ranges) == 0:
+            return False
+        
+        # Check front 60 degrees
+        num_rays = len(ranges)
+        front_start = int(num_rays * 0.7)  # -30 degrees
+        front_end = int(num_rays * 0.3)    # +30 degrees
+        
+        front_ranges = np.concatenate([ranges[:front_end], ranges[front_start:]])
+        front_ranges = front_ranges[np.isfinite(front_ranges)]
+        
+        if len(front_ranges) > 0:
+            min_distance = np.min(front_ranges)
+            return min_distance < self.obstacle_detection_distance
+        
+        return False
+
+    def create_path_msg(self, path):
+        """Create a Path message from list of waypoints"""
+        path_msg = Path()
+        path_msg.header.frame_id = self.map_frame_id
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        
+        for x, y in path:
+            pose_stamped = PoseStamped()
+            pose_stamped.header.frame_id = self.map_frame_id
+            pose_stamped.header.stamp = self.get_clock().now().to_msg()
+            pose_stamped.pose.position.x = x
+            pose_stamped.pose.position.y = y
+            pose_stamped.pose.position.z = 0.0
+            pose_stamped.pose.orientation.w = 1.0
+            path_msg.poses.append(pose_stamped)
+        
+        return path_msg
+
+    def ray_trace(self, start_x, start_y, angle, max_range):
+        """Ray tracing to find expected range measurement"""
+        step = self.map_data.info.resolution / 2  # Sub-pixel accuracy
+        
+        for r in np.arange(0, max_range, step):
+            x = start_x + r * np.cos(angle)
+            y = start_y + r * np.sin(angle)
+            
+            gx, gy = self.world_to_grid(x, y)
+            
+            # Check bounds
+            if gx < 0 or gx >= self.map_data.info.width or gy < 0 or gy >= self.map_data.info.height:
+                return max_range
+            
+            # Check if hit obstacle
+            if self.grid[gy, gx] > 50:  # Obstacle
+                return r
+        
+        return max_range
 
 def main(args=None):
     rclpy.init(args=args)
