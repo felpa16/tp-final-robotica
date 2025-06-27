@@ -256,6 +256,15 @@ class AmclNode(Node):
                 self.state = State.IDLE
                 self.stop_robot()
                 return
+            if self.detect_obstacle():
+                self.get_logger().warn("Obstacle detected. State -> AVOIDING_OBSTACLE")
+                self.state = State.AVOIDING_OBSTACLE
+                self.obstacle_avoidance_active = True
+                q = estimated_pose.orientation
+                self.obstacle_avoidance_start_yaw = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
+                self.obstacle_avoidance_last_yaw = None  # Add this line
+                self.obstacle_avoidance_cumulative_angle = 0.0
+                return
 
             # Check if goal is reached
             goal_distance = self.distance_to_goal(estimated_pose, self.goal_pose)
@@ -355,7 +364,7 @@ class AmclNode(Node):
         delta_rot2 = self.normalize_angle(delta_yaw - delta_rot1)
         
         # Skip if no significant motion
-        if delta_trans < 0.01 and abs(delta_yaw) < 0.01:
+        if delta_trans < 0.001 and abs(delta_yaw) < 0.001:
             self.last_odom_pose = current_odom_pose
             return
         
@@ -594,23 +603,26 @@ class AmclNode(Node):
         if self.grid is None:
             return
         
-        # Create inflated map by dilating obstacles
-        from scipy.ndimage import binary_dilation
+        from scipy.ndimage import binary_dilation, distance_transform_edt
         
         # Convert occupancy grid to binary (obstacle/free)
         obstacle_mask = self.grid > 50  # Cells with >50% probability are obstacles
+        unknown_mask = self.grid == -1  # Unknown cells
+        
+        # Treat unknown as obstacles for safety
+        obstacle_or_unknown = obstacle_mask | unknown_mask
         
         # Create structuring element for inflation
         struct_size = self.safety_margin_cells * 2 + 1
         struct = np.ones((struct_size, struct_size))
         
         # Inflate obstacles
-        inflated_mask = binary_dilation(obstacle_mask, structure=struct)
+        inflated_mask = binary_dilation(obstacle_or_unknown, structure=struct)
         
         # Convert back to occupancy grid format
         self.inflated_grid = np.zeros_like(self.grid)
         self.inflated_grid[inflated_mask] = 100
-        self.inflated_grid[self.grid == -1] = -1  # Keep unknown cells
+        self.inflated_grid[self.grid == -1] = -1  # Keep unknown cells marked
 
     def a_star_planning(self, start_pose, goal_pose):
         """A* path planning algorithm"""
@@ -732,6 +744,11 @@ class AmclNode(Node):
         if not path or len(path) < 2:
             return Twist()
         
+        # Prune path points that are behind the robot
+        path = self.prune_path(current_pose, path)
+        if not path:
+            return Twist()
+        
         # Find lookahead point
         lookahead_point = self.find_lookahead_point(current_pose, path)
         if lookahead_point is None:
@@ -743,6 +760,7 @@ class AmclNode(Node):
         # Calculate distance and angle to lookahead point
         dx = lookahead_point[0] - current_pose.position.x
         dy = lookahead_point[1] - current_pose.position.y
+        distance_to_lookahead = np.sqrt(dx*dx + dy*dy)
         
         # Get current yaw
         q = current_pose.orientation
@@ -752,15 +770,42 @@ class AmclNode(Node):
         desired_yaw = np.arctan2(dy, dx)
         yaw_error = self.normalize_angle(desired_yaw - current_yaw)
         
-        # Control law
-        cmd.linear.x = self.linear_velocity
-        cmd.angular.z = 2.0 * yaw_error  # Proportional control
+        # Adaptive linear velocity based on yaw error
+        if abs(yaw_error) > np.pi/4:  # If error > 45 degrees
+            cmd.linear.x = 0.05  # Move slowly
+        else:
+            # Scale linear velocity based on yaw error
+            cmd.linear.x = self.linear_velocity * (1.0 - 0.5 * abs(yaw_error) / (np.pi/4))
+        
+        # Proportional-Derivative control for angular velocity
+        kp = 2.0  # Proportional gain
+        cmd.angular.z = kp * yaw_error
         
         # Limit angular velocity
         max_angular = 1.0
         cmd.angular.z = np.clip(cmd.angular.z, -max_angular, max_angular)
         
         return cmd
+
+    def prune_path(self, current_pose, path):
+        """Remove path points that are behind the robot or too close"""
+        if not path:
+            return path
+        
+        current_x = current_pose.position.x
+        current_y = current_pose.position.y
+        
+        # Find the closest point ahead of the robot
+        pruned_path = []
+        for i, (px, py) in enumerate(path):
+            dist = np.sqrt((px - current_x)**2 + (py - current_y)**2)
+            
+            # Keep points that are ahead and not too close
+            if dist > self.path_pruning_distance:
+                pruned_path = path[i:]
+                break
+        
+        return pruned_path if pruned_path else [path[-1]]  # Always keep the goal
 
     def find_lookahead_point(self, current_pose, path):
         """Find the lookahead point on the path"""
@@ -811,23 +856,31 @@ class AmclNode(Node):
         if self.latest_scan is None:
             return False
         
-        # Check for obstacles in the front arc
         ranges = np.array(self.latest_scan.ranges)
-        valid_ranges = ranges[np.isfinite(ranges)]
         
-        if len(valid_ranges) == 0:
-            return False
-        
-        # Check front 60 degrees
+        # Calculate the indices for front 60 degrees (-30 to +30)
         num_rays = len(ranges)
-        front_start = int(num_rays * 0.7)  # -30 degrees
-        front_end = int(num_rays * 0.3)    # +30 degrees
+        angle_min = self.latest_scan.angle_min
+        angle_max = self.latest_scan.angle_max
+        angle_increment = self.latest_scan.angle_increment
         
-        front_ranges = np.concatenate([ranges[:front_end], ranges[front_start:]])
-        front_ranges = front_ranges[np.isfinite(front_ranges)]
+        # Find indices for -30 and +30 degrees
+        front_angle_min = -np.pi/6  # -30 degrees
+        front_angle_max = np.pi/6   # +30 degrees
         
-        if len(front_ranges) > 0:
-            min_distance = np.min(front_ranges)
+        front_start_idx = int((front_angle_min - angle_min) / angle_increment)
+        front_end_idx = int((front_angle_max - angle_min) / angle_increment)
+        
+        # Ensure indices are within bounds
+        front_start_idx = max(0, front_start_idx)
+        front_end_idx = min(num_rays - 1, front_end_idx)
+        
+        # Get front ranges
+        front_ranges = ranges[front_start_idx:front_end_idx+1]
+        valid_front_ranges = front_ranges[np.isfinite(front_ranges) & (front_ranges > 0)]
+        
+        if len(valid_front_ranges) > 0:
+            min_distance = np.min(valid_front_ranges)
             return min_distance < self.obstacle_detection_distance
         
         return False
